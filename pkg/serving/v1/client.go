@@ -319,16 +319,22 @@ func (cl *knServingClient) DeleteService(serviceName string, timeout time.Durati
 		return cl.deleteService(serviceName, v1.DeletePropagationBackground)
 	}
 	waitC := make(chan error)
+	waitForEvent := wait.NewWaitForEvent("service", cl.WatchService, func(evt *watch.Event) bool { return evt.Type == watch.Deleted })
 	go func() {
-		waitForEvent := wait.NewWaitForEvent("service", cl.WatchService, func(evt *watch.Event) bool { return evt.Type == watch.Deleted })
 		err, _ := waitForEvent.Wait(serviceName, wait.Options{Timeout: &timeout}, wait.NoopMessageCallback())
 		waitC <- err
 	}()
-	err := cl.deleteService(serviceName, v1.DeletePropagationForeground)
-	if err != nil {
+	select {
+	case <-waitForEvent.Waiting():
+		err := cl.deleteService(serviceName, v1.DeletePropagationForeground)
+		if err != nil {
+			return clienterrors.GetError(err)
+		}
+	case err := <-waitC:
 		return err
 	}
-	return <-waitC
+
+	return nil
 }
 
 func (cl *knServingClient) deleteService(serviceName string, propagationPolicy v1.DeletionPropagation) error {
@@ -460,17 +466,22 @@ func (cl *knServingClient) DeleteRevision(name string, timeout time.Duration) er
 		return cl.deleteRevision(name)
 	}
 	waitC := make(chan error)
+	waitForEvent := wait.NewWaitForEvent("revision", cl.WatchRevision, func(evt *watch.Event) bool { return evt.Type == watch.Deleted })
 	go func() {
-		waitForEvent := wait.NewWaitForEvent("revision", cl.WatchRevision, func(evt *watch.Event) bool { return evt.Type == watch.Deleted })
 		err, _ := waitForEvent.Wait(name, wait.Options{Timeout: &timeout}, wait.NoopMessageCallback())
 		waitC <- err
 	}()
-	err = cl.deleteRevision(name)
-	if err != nil {
-		return clienterrors.GetError(err)
+	select {
+	case <-waitForEvent.Waiting():
+		err = cl.deleteRevision(name)
+		if err != nil {
+			return clienterrors.GetError(err)
+		}
+	case err = <-waitC:
+		return err
 	}
 
-	return <-waitC
+	return nil
 }
 
 func (cl *knServingClient) deleteRevision(name string) error {

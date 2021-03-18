@@ -17,6 +17,7 @@ package wait
 import (
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +31,8 @@ type waitForReadyConfig struct {
 	watchMaker          WatchMaker
 	conditionsExtractor ConditionsExtractor
 	kind                string
+	waiting             chan bool
+	setWaiting          *sync.Once
 }
 
 // Callbacks and configuration used while waiting for event
@@ -37,6 +40,8 @@ type waitForEvent struct {
 	watchMaker WatchMaker
 	eventDone  EventDone
 	kind       string
+	waiting    chan bool
+	setWaiting *sync.Once
 }
 
 // EventDone is a marker to stop actual waiting on given event state
@@ -50,6 +55,7 @@ type Wait interface {
 	// and write event messages for unknown event to the status writer.
 	// Returns an error (if any) and the overall time it took to wait
 	Wait(name string, options Options, msgCallback MessageCallback) (error, time.Duration)
+	Waiting() <-chan bool
 }
 
 type Options struct {
@@ -76,6 +82,8 @@ func NewWaitForReady(kind string, watchMaker WatchMaker, extractor ConditionsExt
 		kind:                kind,
 		watchMaker:          watchMaker,
 		conditionsExtractor: extractor,
+		waiting:             make(chan bool, 1),
+		setWaiting:          &sync.Once{},
 	}
 }
 
@@ -86,6 +94,8 @@ func NewWaitForEvent(kind string, watchMaker WatchMaker, eventDone EventDone) Wa
 		kind:       kind,
 		watchMaker: watchMaker,
 		eventDone:  eventDone,
+		waiting:    make(chan bool, 1),
+		setWaiting: &sync.Once{},
 	}
 }
 
@@ -129,10 +139,15 @@ func (w *waitForReadyConfig) Wait(name string, options Options, msgCallback Mess
 
 		if retry {
 			// restart loop
+			time.Sleep(time.Second)
 			continue
 		}
 		return nil, time.Since(start)
 	}
+}
+
+func (w *waitForReadyConfig) Waiting() <-chan bool {
+	return w.waiting
 }
 
 // waitForReadyCondition waits until the status condition "Ready" is set to true (good path) or return an error
@@ -148,6 +163,8 @@ func (w *waitForReadyConfig) waitForReadyCondition(start time.Time, name string,
 		return false, false, err
 	}
 	defer watcher.Stop()
+
+	w.setWaiting.Do(func() { w.waiting <- true })
 
 	// channel used to transport the error that has been received
 	errChan := make(chan error)
@@ -246,6 +263,9 @@ func (w *waitForEvent) Wait(name string, options Options, msgCallback MessageCal
 		return err, 0
 	}
 	defer watcher.Stop()
+
+	w.setWaiting.Do(func() { w.waiting <- true })
+
 	start := time.Now()
 	// channel used to transport the error
 	errChan := make(chan error)
@@ -263,6 +283,10 @@ func (w *waitForEvent) Wait(name string, options Options, msgCallback MessageCal
 			}
 		}
 	}
+}
+
+func (w *waitForEvent) Waiting() <-chan bool {
+	return w.waiting
 }
 
 func generationCheck(object runtime.Object) (bool, error) {
