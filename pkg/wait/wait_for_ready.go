@@ -17,6 +17,7 @@ package wait
 import (
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +31,8 @@ type waitForReadyConfig struct {
 	watchMaker          WatchMaker
 	conditionsExtractor ConditionsExtractor
 	kind                string
+	waiting             chan bool
+	setWaiting          *sync.Once
 }
 
 // Callbacks and configuration used while waiting for event
@@ -37,6 +40,8 @@ type waitForEvent struct {
 	watchMaker WatchMaker
 	eventDone  EventDone
 	kind       string
+	waiting    chan bool
+	setWaiting *sync.Once
 }
 
 // EventDone is a marker to stop actual waiting on given event state
@@ -50,6 +55,7 @@ type Wait interface {
 	// and write event messages for unknown event to the status writer.
 	// Returns an error (if any) and the overall time it took to wait
 	Wait(name string, options Options, msgCallback MessageCallback) (error, time.Duration)
+	Waiting() <-chan bool
 }
 
 type Options struct {
@@ -76,6 +82,8 @@ func NewWaitForReady(kind string, watchMaker WatchMaker, extractor ConditionsExt
 		kind:                kind,
 		watchMaker:          watchMaker,
 		conditionsExtractor: extractor,
+		waiting:             make(chan bool, 2),
+		setWaiting:          &sync.Once{},
 	}
 }
 
@@ -86,6 +94,8 @@ func NewWaitForEvent(kind string, watchMaker WatchMaker, eventDone EventDone) Wa
 		kind:       kind,
 		watchMaker: watchMaker,
 		eventDone:  eventDone,
+		waiting:    make(chan bool, 2),
+		setWaiting: &sync.Once{},
 	}
 }
 
@@ -113,6 +123,7 @@ func NoopMessageCallback() MessageCallback {
 // target state has been entered yet and `out` is used for printing out status messages
 // msgCallback gets called for every event with an 'Ready' condition == UNKNOWN with the event's message.
 func (w *waitForReadyConfig) Wait(name string, options Options, msgCallback MessageCallback) (error, time.Duration) {
+	defer func() { w.waiting <- false }()
 
 	timeout := options.timeoutWithDefault()
 	floatingTimeout := timeout
@@ -129,10 +140,15 @@ func (w *waitForReadyConfig) Wait(name string, options Options, msgCallback Mess
 
 		if retry {
 			// restart loop
+			time.Sleep(time.Millisecond * 250)
 			continue
 		}
 		return nil, time.Since(start)
 	}
+}
+
+func (w *waitForReadyConfig) Waiting() <-chan bool {
+	return w.waiting
 }
 
 // waitForReadyCondition waits until the status condition "Ready" is set to true (good path) or return an error
@@ -149,6 +165,8 @@ func (w *waitForReadyConfig) waitForReadyCondition(start time.Time, name string,
 	}
 	defer watcher.Stop()
 
+	w.setWaiting.Do(func() { w.waiting <- true })
+
 	// channel used to transport the error that has been received
 	errChan := make(chan error)
 
@@ -162,9 +180,12 @@ func (w *waitForReadyConfig) waitForReadyCondition(start time.Time, name string,
 		}
 	})()
 
+	timeoutTimer := time.NewTimer(timeout)
+	defer timeoutTimer.Stop()
+
 	for {
 		select {
-		case <-time.After(timeout):
+		case <-timeoutTimer.C:
 			// We reached a timeout without receiving a "Ready" == "True" event
 			return false, true, nil
 		case err = <-errChan:
@@ -240,29 +261,46 @@ func (w *waitForReadyConfig) waitForReadyCondition(start time.Time, name string,
 
 // Wait until the expected EventDone is satisfied
 func (w *waitForEvent) Wait(name string, options Options, msgCallback MessageCallback) (error, time.Duration) {
-	timeout := options.timeoutWithDefault()
-	watcher, err := w.watchMaker(name, timeout)
-	if err != nil {
-		return err, 0
-	}
-	defer watcher.Stop()
+	defer func() { w.waiting <- false }()
+
 	start := time.Now()
-	// channel used to transport the error
-	errChan := make(chan error)
+	timeout := options.timeoutWithDefault()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+
 	for {
-		select {
-		case <-timer.C:
-			return fmt.Errorf("timeout: %s '%s' not ready after %d seconds", w.kind, name, int(timeout/time.Second)), time.Since(start)
-		case err = <-errChan:
-			return err, time.Since(start)
-		case event := <-watcher.ResultChan():
-			if w.eventDone(&event) {
-				return nil, time.Since(start)
+		watcher, err := w.watchMaker(name, timeout)
+		if err != nil {
+			return err, 0
+		}
+		defer watcher.Stop()
+
+		w.setWaiting.Do(func() { w.waiting <- true })
+		// channel used to transport the error
+		errChan := make(chan error)
+		defer close(errChan)
+
+	DoWait:
+		for {
+			select {
+			case <-timer.C:
+				return fmt.Errorf("timeout: %s '%s' not ready after %d seconds", w.kind, name, int(timeout/time.Second)), time.Since(start)
+			case err = <-errChan:
+				return err, time.Since(start)
+			case event, ok := <-watcher.ResultChan():
+				if !ok {
+					break DoWait
+				}
+				if w.eventDone(&event) {
+					return nil, time.Since(start)
+				}
 			}
 		}
 	}
+}
+
+func (w *waitForEvent) Waiting() <-chan bool {
+	return w.waiting
 }
 
 func generationCheck(object runtime.Object) (bool, error) {
